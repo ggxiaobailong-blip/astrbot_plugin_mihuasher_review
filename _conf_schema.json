@@ -1,0 +1,40 @@
+{
+  "cookie": {
+    "type": "string",
+    "title": "米画师 Cookie",
+    "description": "从浏览器开发者工具中复制的完整 Cookie 字符串",
+    "default": ""
+  },
+  "default_artist_id": {
+    "type": "string",
+    "title": "默认画师 ID",
+    "description": "用于测试或未指定ID时使用的画师ID",
+    "default": ""
+  },
+  "max_reviews_display": {
+    "type": "int",
+    "title": "每次展示的最大评价数",
+    "description": "使用 /check_review 命令时最多返回几条评价",
+    "default": 10,
+    "minimum": 1,
+    "maximum": 50
+  },
+  "enable_auto_push": {
+    "type": "bool",
+    "title": "启用自动推送",
+    "description": "开启后，机器人会定时检查所有订阅画师的新评价并推送",
+    "default": false
+  },
+  "push_cron": {
+    "type": "string",
+    "title": "推送检查 Cron 表达式",
+    "description": "例如：0 */30 * * * * 表示每30分钟检查一次",
+    "default": "0 */30 * * * *"
+  },
+  "push_target": {
+    "type": "string",
+    "title": "全局推送目标（可选）",
+    "description": "填群号，所有推送将统一发至此群。留空则发给每个订阅者当前订阅的会话。",
+    "default": ""
+  }
+}
