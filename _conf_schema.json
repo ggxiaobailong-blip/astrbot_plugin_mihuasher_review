@@ -28,13 +28,19 @@
   "push_cron": {
     "type": "string",
     "title": "推送检查 Cron 表达式",
-    "description": "例如：0 */30 * * * * 表示每30分钟检查一次",
-    "default": "0 */30 * * * *"
+    "description": "标准 5 段 cron，例如 */30 * * * * 表示每30分钟",
+    "default": "*/30 * * * *"
   },
   "push_target": {
     "type": "string",
     "title": "全局推送目标（可选）",
     "description": "填群号，所有推送将统一发至此群。留空则发给每个订阅者当前订阅的会话。",
+    "default": ""
+  },
+  "artist_info_list": {
+    "type": "text",
+    "title": "画师信息列表",
+    "description": "一行一个画师，格式：画师ID,画师名,头像URL。例如：\n1093248,冰宫Asylum,https://...\n182276,小企鹅呐,https://...",
     "default": ""
   }
 }
