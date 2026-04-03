@@ -19,6 +19,14 @@
     "minimum": 1,
     "maximum": 50
   },
+  "max_cached_reviews": {
+    "type": "int",
+    "title": "最大缓存评价数",
+    "description": "每个画师本地缓存的最大评价条数，用于去重。建议 200-1000",
+    "default": 500,
+    "minimum": 100,
+    "maximum": 2000
+  },
   "enable_auto_push": {
     "type": "bool",
     "title": "启用自动推送",

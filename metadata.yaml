@@ -1,7 +1,7 @@
 name: astrbot_plugin_mihuasher_review
 display_name: 米画师视奸插件
 desc: 获取米画师指定画师的评价列表，并支持订阅推送。可通过QQ命令手动检查或定时自动推送新评价。
-version: 1.0.4
+version: 1.0.5
 author: iv小白龙
 repo: https://github.com/ggxiaobailong-blip/astrbot_plugin_mihuasher_review
 tags:

@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, List, Set, Tuple
 import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from bs4 import BeautifulSoup
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -19,7 +20,7 @@ from astrbot.api.star import Context, Star, register, StarTools
     "astrbot_plugin_mihuasher_review",
     "iv小白龙",
     "获取米画师画师评价并推送",
-    "1.0.4",
+    "1.0.6",
     "https://github.com/ggxiaobailong-blip/astrbot_plugin_mihuasher_review"
 )
 class MihuasherReviewPlugin(Star):
@@ -29,12 +30,18 @@ class MihuasherReviewPlugin(Star):
         self.cookie = config.get("cookie", "")
         self.default_artist_id = config.get("default_artist_id", "")
 
-        # 容错 + 范围限制
         try:
             self.max_display = int(config.get("max_reviews_display", 10))
         except (ValueError, TypeError):
             self.max_display = 10
-        self.max_display = max(1, min(50, self.max_display))  # 限制 1-50
+        self.max_display = max(1, min(50, self.max_display))
+
+        # 新增：最大缓存评价条数
+        try:
+            self.max_cached_reviews = int(config.get("max_cached_reviews", 500))
+        except (ValueError, TypeError):
+            self.max_cached_reviews = 500
+        self.max_cached_reviews = max(100, min(2000, self.max_cached_reviews))
 
         self.enable_auto_push = config.get("enable_auto_push", False)
         self.push_cron = config.get("push_cron", "*/30 * * * *")
@@ -60,8 +67,7 @@ class MihuasherReviewPlugin(Star):
 
         # 复用 HTTP 会话
         self._session: Optional[aiohttp.ClientSession] = None
-
-        # 画师信息内存缓存（避免重复请求主页），TTL 1天
+        # 画师信息内存缓存，TTL 1天
         self._artist_info_cache: Dict[str, Dict[str, Any]] = {}
 
         self.scheduler: Optional[AsyncIOScheduler] = None
@@ -76,14 +82,71 @@ class MihuasherReviewPlugin(Star):
         elif self.enable_auto_push and not self.cookie:
             logger.warning("自动推送已启用但未配置 Cookie，无法启动调度器")
 
+    # ==================== 辅助方法 ====================
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    async def _load_subscriptions(self) -> List[Dict[str, Any]]:
+        """线程安全地读取订阅文件"""
+        subs_file = self.data_dir / "subscriptions.json"
+        async with self._file_lock:
+            try:
+                if subs_file.exists():
+                    with open(subs_file, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"读取订阅文件失败，将重新初始化: {e}")
+            return []
+
+    async def _save_subscriptions(self, subscriptions: List[Dict[str, Any]]) -> bool:
+        """原子写入订阅文件，返回是否成功"""
+        subs_file = self.data_dir / "subscriptions.json"
+        temp_path = subs_file.with_suffix(".tmp")
+        async with self._file_lock:
+            try:
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(subscriptions, f, ensure_ascii=False, indent=2)
+                temp_path.replace(subs_file)
+                return True
+            except Exception as e:
+                logger.error(f"保存订阅文件失败: {e}")
+                return False
+
+    def _get_review_key(self, review: Dict[str, Any]) -> str:
+        """为评论生成唯一键：优先使用 id，否则构造指纹"""
+        if review.get('id'):
+            return f"id:{review['id']}"
+        content = review.get('content', '')
+        time_str = review.get('time', '')
+        commenter = review.get('commenter_name', '')
+        fp = f"{content}|{time_str}|{commenter}"
+        return f"fp:{hash(fp)}"
+
+    def _get_global_target(self) -> Optional[str]:
+        """根据配置的全局推送目标，返回 unified_msg_origin"""
+        target = self.global_push_target.strip()
+        if not target:
+            return None
+        # 如果已经是完整标识符（包含冒号），直接使用
+        if ':' in target:
+            return target
+        # 否则假设是 QQ 群号，拼接为 aiocqhttp 格式（向后兼容）
+        if target.isdigit():
+            return f"aiocqhttp:group_{target}"
+        # 其他情况返回原值（可能是平台:标识）
+        return target
+
+    # ==================== 调度器 ====================
     def _init_scheduler(self):
+        """初始化或重启调度器（修复版）"""
+        # 如果已有运行的调度器，直接返回
         if self.scheduler and self.scheduler.running:
             return
+        # 如果存在但未运行，先清理并置空
+        if self.scheduler:
+            self._stop_scheduler()
         self.scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
         try:
             cron_expr = self.push_cron.strip()
@@ -107,8 +170,13 @@ class MihuasherReviewPlugin(Star):
     def _stop_scheduler(self):
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown()
+            self.scheduler = None
             logger.info("[米画师] 调度器已停止")
+        elif self.scheduler:
+            # 未运行但也置空
+            self.scheduler = None
 
+    # ==================== 评价缓存 ====================
     def _get_storage_file(self, artist_id: str) -> Path:
         return self.data_dir / f"artist_{artist_id}.json"
 
@@ -124,9 +192,10 @@ class MihuasherReviewPlugin(Star):
         return {"last_reviews": []}
 
     async def _save_reviews(self, artist_id: str, reviews: List[Dict[str, Any]]):
+        """保存评价缓存，并限制最大条数"""
         file_path = self._get_storage_file(artist_id)
-        if len(reviews) > 100:
-            reviews = reviews[:100]
+        if len(reviews) > self.max_cached_reviews:
+            reviews = reviews[:self.max_cached_reviews]
         data = {"last_reviews": reviews}
         temp_path = file_path.with_suffix(".tmp")
         try:
@@ -137,17 +206,7 @@ class MihuasherReviewPlugin(Star):
         except Exception as e:
             logger.error(f"保存评价缓存失败 ({artist_id}): {e}")
 
-    def _get_review_key(self, review: Dict[str, Any]) -> str:
-        """为评论生成唯一键：优先使用 id，否则构造指纹"""
-        if review.get('id'):
-            return f"id:{review['id']}"
-        # 指纹：content + time + commenter_name
-        content = review.get('content', '')
-        time_str = review.get('time', '')
-        commenter = review.get('commenter_name', '')
-        fp = f"{content}|{time_str}|{commenter}"
-        return f"fp:{hash(fp)}"
-
+    # ==================== 核心数据获取 ====================
     async def fetch_reviews(self, artist_id: str) -> Dict[str, Any]:
         """
         返回格式: {
@@ -202,9 +261,12 @@ class MihuasherReviewPlugin(Star):
                     return {"artist_info": {}, "reviews": [], "error": f"API 返回错误码 {resp.status}"}
         except asyncio.TimeoutError:
             return {"artist_info": {}, "reviews": [], "error": "请求超时"}
+        except aiohttp.ClientError as e:
+            logger.error(f"网络请求异常: {e}")
+            return {"artist_info": {}, "reviews": [], "error": f"网络错误: {str(e)}"}
         except Exception as e:
             logger.error(f"获取评价失败: {e}")
-            return {"artist_info": {}, "reviews": [], "error": f"请求异常: {str(e)}"}
+            return {"artist_info": {}, "reviews": [], "error": f"未知错误: {str(e)}"}
 
         # 获取画师信息（优先级：WebUI配置 > 内存缓存 > 主页解析）
         map_info = self.artist_info_map.get(str(artist_id), {})
@@ -212,7 +274,6 @@ class MihuasherReviewPlugin(Star):
             artist_name = map_info.get("name", str(artist_id))
             artist_avatar = map_info.get("avatar", "")
         else:
-            # 查内存缓存
             now = time.time()
             cached = self._artist_info_cache.get(artist_id)
             if cached and cached.get('expire', 0) > now:
@@ -231,13 +292,14 @@ class MihuasherReviewPlugin(Star):
                     async with session.get(profile_url, headers=html_headers, timeout=10) as resp:
                         if resp.status == 200:
                             html = await resp.text()
-                            from bs4 import BeautifulSoup
                             soup = BeautifulSoup(html, 'html.parser')
                             name_elem = soup.find('h2', class_='user-profile__name')
                             if name_elem:
                                 name_text = name_elem.get_text(strip=True)
-                                name_match = re.match(r'^([^\d]+)', name_text)
-                                artist_name = name_match.group(1).strip() if name_match else name_text
+                                # 保留数字开头的画师名，仅移除末尾可能带的ID数字（根据实际格式调整）
+                                # 此处简单处理：如果名称中不含数字ID模式，就直接用原文本
+                                # 更稳健的做法：直接使用 name_text 不做正则
+                                artist_name = name_text
                                 logger.info(f"自动解析画师名字: {artist_name}")
                             avatar_img = soup.find('img', class_='h-full w-full object-cover')
                             if avatar_img and avatar_img.get('src'):
@@ -248,6 +310,8 @@ class MihuasherReviewPlugin(Star):
                                 logger.info(f"自动解析画师头像: {artist_avatar[:80]}...")
                         else:
                             logger.warning(f"获取画师主页失败: {resp.status}")
+                except aiohttp.ClientError as e:
+                    logger.warning(f"请求画师主页网络错误: {e}")
                 except Exception as e:
                     logger.warning(f"解析画师信息失败: {e}")
                 # 缓存结果，TTL 1天
@@ -278,7 +342,6 @@ class MihuasherReviewPlugin(Star):
 
         is_cold_start = not saved_reviews
 
-        # 使用稳定键去重
         saved_keys = {self._get_review_key(r) for r in saved_reviews}
         new_reviews = [r for r in current_reviews if self._get_review_key(r) not in saved_keys]
 
@@ -289,6 +352,7 @@ class MihuasherReviewPlugin(Star):
                 return []
         return new_reviews
 
+    # ==================== 消息发送 ====================
     async def _send_as_image(self, target_origin: str, artist_id: str, rev: Dict[str, Any]):
         content = rev['content']
         time_str = rev['time']
@@ -305,6 +369,7 @@ class MihuasherReviewPlugin(Star):
             **📅 时间**: {time_str}
         """)
         try:
+            # AstrBot 的 Star 基类提供了 text_to_image 方法
             image_url = await self.text_to_image(markdown_text)
             if image_url:
                 await self.context.send_message(target_origin, MessageChain().image(image_url))
@@ -315,35 +380,24 @@ class MihuasherReviewPlugin(Star):
             fallback_msg = f"📢 画师 {artist_id} 有新评价！\n甲方：{commenter_name}\n📝 {content}\n📅 {time_str}"
             await self.context.send_message(target_origin, MessageChain().message(fallback_msg))
 
+    # ==================== 定时任务 ====================
     async def _auto_check_all_subscriptions(self):
         """定时检查所有订阅画师（并发检查 + 并发推送）"""
         logger.info("[米画师] 定时检查所有订阅画师")
-        subs_file = self.data_dir / "subscriptions.json"
-        if not subs_file.exists():
+        subscriptions = await self._load_subscriptions()
+        if not subscriptions:
             return
 
-        try:
-            async with self._file_lock:
-                with open(subs_file, 'r', encoding='utf-8') as f:
-                    subscriptions = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"读取订阅文件失败: {e}")
-            return
-
-        global_target = self.global_push_target.strip()
+        global_target = self._get_global_target()
         if global_target:
-            if global_target.isdigit():
-                global_origin = f"aiocqhttp:group_{global_target}"
-            else:
-                global_origin = global_target
-            logger.info(f"使用全局推送目标: {global_origin}")
+            logger.info(f"使用全局推送目标: {global_target}")
 
         # 按画师分组
         artist_targets: Dict[str, Set[str]] = {}
         for sub in subscriptions:
             aid = sub.get("artist_id")
             if global_target:
-                target = global_origin
+                target = global_target
             else:
                 target = sub.get("target_session")
             if aid and target:
@@ -363,7 +417,6 @@ class MihuasherReviewPlugin(Star):
         check_tasks = [check_one(aid) for aid in artist_targets.keys()]
         results = await asyncio.gather(*check_tasks)
 
-        # 收集需要推送的任务
         push_tasks = []
         for res in results:
             if res is None:
@@ -374,7 +427,6 @@ class MihuasherReviewPlugin(Star):
                     push_tasks.append(self._send_as_image(target, artist_id, rev))
 
         if push_tasks:
-            # 并发推送，限制同时最多5个
             push_sem = asyncio.Semaphore(5)
 
             async def limited_push(task):
@@ -384,9 +436,12 @@ class MihuasherReviewPlugin(Star):
             await asyncio.gather(*[limited_push(t) for t in push_tasks])
             logger.info(f"本次定时检查共推送 {len(push_tasks)} 条消息")
 
+    # ==================== 命令 ====================
     @filter.command("check_review")
     async def check_review(self, event: AstrMessageEvent):
-        args = event.message_str.strip().split()
+        # 使用 event.message_str 获取消息的纯文本内容
+        plain_text = event.message_str
+        args = plain_text.strip().split()
         if len(args) >= 2:
             artist_id = args[1]
         elif self.default_artist_id:
@@ -396,7 +451,6 @@ class MihuasherReviewPlugin(Star):
             yield event.plain_result("请提供画师ID，例如：/check_review 182276，或在插件配置中设置默认画师ID")
             return
 
-        # 格式校验
         if not artist_id.isdigit():
             yield event.plain_result("❌ 画师ID必须是数字")
             return
@@ -457,7 +511,8 @@ class MihuasherReviewPlugin(Star):
 
     @filter.command("subscribe")
     async def subscribe(self, event: AstrMessageEvent):
-        args = event.message_str.strip().split()
+        plain_text = event.message_str
+        args = plain_text.strip().split()
         if len(args) < 2:
             yield event.plain_result("请提供画师ID，例如：/subscribe 182276")
             return
@@ -469,44 +524,29 @@ class MihuasherReviewPlugin(Star):
         user_id = event.get_sender_id()
         target_session = event.unified_msg_origin
 
-        subs_file = self.data_dir / "subscriptions.json"
-        async with self._file_lock:
-            try:
-                if subs_file.exists():
-                    with open(subs_file, 'r', encoding='utf-8') as f:
-                        subscriptions = json.load(f)
-                else:
-                    subscriptions = []
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"读取订阅文件失败，将重新初始化: {e}")
-                subscriptions = []
-
-            new_sub = {
-                "artist_id": artist_id,
-                "user_id": user_id,
-                "target_session": target_session,
-                "subscribe_time": int(time.time())
-            }
-            exists = any(
-                s.get("artist_id") == artist_id and s.get("target_session") == target_session for s in subscriptions)
-            if not exists:
-                subscriptions.append(new_sub)
-                temp_path = subs_file.with_suffix(".tmp")
-                try:
-                    with open(temp_path, 'w', encoding='utf-8') as f:
-                        json.dump(subscriptions, f, ensure_ascii=False, indent=2)
-                    temp_path.replace(subs_file)
-                except Exception as e:
-                    logger.error(f"保存订阅失败: {e}")
-                    yield event.plain_result("❌ 订阅失败，请稍后重试")
-                    return
-                yield event.plain_result(f"✅ 已订阅画师 {artist_id} 的评价更新，将推送至当前会话")
-            else:
-                yield event.plain_result(f"ℹ️ 当前会话已订阅过画师 {artist_id}")
+        subscriptions = await self._load_subscriptions()
+        new_sub = {
+            "artist_id": artist_id,
+            "user_id": user_id,
+            "target_session": target_session,
+            "subscribe_time": int(time.time())
+        }
+        exists = any(
+            s.get("artist_id") == artist_id and s.get("target_session") == target_session for s in subscriptions)
+        if not exists:
+            subscriptions.append(new_sub)
+            success = await self._save_subscriptions(subscriptions)
+            if not success:
+                yield event.plain_result("❌ 订阅失败，请稍后重试")
+                return
+            yield event.plain_result(f"✅ 已订阅画师 {artist_id} 的评价更新，将推送至当前会话")
+        else:
+            yield event.plain_result(f"ℹ️ 当前会话已订阅过画师 {artist_id}")
 
     @filter.command("unsubscribe")
     async def unsubscribe(self, event: AstrMessageEvent):
-        args = event.message_str.strip().split()
+        plain_text = event.message_str
+        args = plain_text.strip().split()
         if len(args) < 2:
             yield event.plain_result("请提供画师ID，例如：/unsubscribe 182276")
             return
@@ -517,51 +557,28 @@ class MihuasherReviewPlugin(Star):
 
         target_session = event.unified_msg_origin
 
-        subs_file = self.data_dir / "subscriptions.json"
-        if not subs_file.exists():
+        subscriptions = await self._load_subscriptions()
+        if not subscriptions:
             yield event.plain_result("你还没有任何订阅")
             return
 
-        async with self._file_lock:
-            try:
-                with open(subs_file, 'r', encoding='utf-8') as f:
-                    subscriptions = json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                logger.error(f"读取订阅文件失败: {e}")
-                yield event.plain_result("❌ 读取订阅失败，请稍后重试")
+        new_subs = [s for s in subscriptions if
+                    not (s.get("artist_id") == artist_id and s.get("target_session") == target_session)]
+        if len(new_subs) < len(subscriptions):
+            success = await self._save_subscriptions(new_subs)
+            if not success:
+                yield event.plain_result("❌ 取消订阅失败，请稍后重试")
                 return
-
-            new_subs = [s for s in subscriptions if
-                        not (s.get("artist_id") == artist_id and s.get("target_session") == target_session)]
-            if len(new_subs) < len(subscriptions):
-                temp_path = subs_file.with_suffix(".tmp")
-                try:
-                    with open(temp_path, 'w', encoding='utf-8') as f:
-                        json.dump(new_subs, f, ensure_ascii=False, indent=2)
-                    temp_path.replace(subs_file)
-                except Exception as e:
-                    logger.error(f"保存取消订阅失败: {e}")
-                    yield event.plain_result("❌ 取消订阅失败，请稍后重试")
-                    return
-                yield event.plain_result(f"✅ 已取消订阅画师 {artist_id}（当前会话）")
-            else:
-                yield event.plain_result(f"❌ 当前会话没有订阅画师 {artist_id}")
+            yield event.plain_result(f"✅ 已取消订阅画师 {artist_id}（当前会话）")
+        else:
+            yield event.plain_result(f"❌ 当前会话没有订阅画师 {artist_id}")
 
     @filter.command("list_sub")
     async def list_subscriptions(self, event: AstrMessageEvent):
         target_session = event.unified_msg_origin
-        subs_file = self.data_dir / "subscriptions.json"
-        if not subs_file.exists():
+        subscriptions = await self._load_subscriptions()
+        if not subscriptions:
             yield event.plain_result("你还没有任何订阅")
-            return
-
-        try:
-            async with self._file_lock:
-                with open(subs_file, 'r', encoding='utf-8') as f:
-                    subscriptions = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"读取订阅文件失败: {e}")
-            yield event.plain_result("❌ 读取订阅失败，请稍后重试")
             return
 
         my_subs = [s for s in subscriptions if s.get("target_session") == target_session]
