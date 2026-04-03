@@ -57,7 +57,6 @@
 
 示例：
 1093248,冰宫Asylum,https://image-assets.mihuashi.com/permanent/1093248|-2023/12/23/00/FoEuzgtPojt0dM0nwTm23OzuH9un.jpg
-
 182276,小企鹅呐,https://image-assets.mihuashi.com/default_avatar/employer3.jpg
 
 > **如何获取画师头像 URL？**  
