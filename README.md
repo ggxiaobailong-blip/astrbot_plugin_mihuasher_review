@@ -31,7 +31,7 @@
 
 插件需要通过 Cookie 访问米画师 API，请按以下步骤获取：
 
-1. 使用 Chrome 浏览器登录米画师网站（https://www.mihuashi.com）
+1. 使用 Chrome 浏览器登录米画师网站：https://www.mihuashi.com
 2. 打开开发者工具（F12）→ Network（网络）标签
 3. 刷新页面，在请求列表中找到任意一个 `api/v1/` 开头的请求
 4. 点击该请求，在 **Request Headers** 中找到 `cookie:` 字段
