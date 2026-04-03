@@ -27,12 +27,19 @@ class MihuasherReviewPlugin(Star):
         config = config or {}
         self.cookie = config.get("cookie", "")
         self.default_artist_id = config.get("default_artist_id", "")
-        self.max_display = int(config.get("max_reviews_display", 10))
+
+        # 容错处理：防止配置中的非数字导致崩溃
+        try:
+            self.max_display = int(config.get("max_reviews_display", 10))
+        except (ValueError, TypeError):
+            self.max_display = 10
+            logger.warning("max_reviews_display 配置无效，使用默认值 10")
+
         self.enable_auto_push = config.get("enable_auto_push", False)
         self.push_cron = config.get("push_cron", "*/30 * * * *")
         self.global_push_target = config.get("push_target", "")
 
-        # 从 WebUI 配置解析画师信息列表
+        # 解析画师信息列表
         self.artist_info_map = {}
         artist_info_text = config.get("artist_info_list", "")
         if artist_info_text:
@@ -50,6 +57,9 @@ class MihuasherReviewPlugin(Star):
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_mihuasher_review")
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+        # 复用 HTTP 会话
+        self._session = None
+
         self.scheduler = None
         self._file_lock = asyncio.Lock()
 
@@ -62,12 +72,24 @@ class MihuasherReviewPlugin(Star):
         elif self.enable_auto_push and not self.cookie:
             logger.warning("自动推送已启用但未配置 Cookie，无法启动调度器")
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建复用的 HTTP 会话"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
     def _init_scheduler(self):
         if self.scheduler and self.scheduler.running:
             return
         self.scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
         try:
-            trigger = CronTrigger.from_crontab(self.push_cron)
+            # 兼容旧配置：如果是6段表达式，自动转为5段
+            cron_expr = self.push_cron.strip()
+            parts = cron_expr.split()
+            if len(parts) == 6:
+                cron_expr = ' '.join(parts[1:])
+                logger.warning(f"[米画师] 检测到6段cron表达式，已自动转换为5段: {cron_expr}")
+            trigger = CronTrigger.from_crontab(cron_expr)
             self.scheduler.add_job(
                 func=self._auto_check_all_subscriptions,
                 trigger=trigger,
@@ -76,7 +98,7 @@ class MihuasherReviewPlugin(Star):
                 coalesce=True
             )
             self.scheduler.start()
-            logger.info(f"[米画师] 自动推送已启用，Cron: {self.push_cron}")
+            logger.info(f"[米画师] 自动推送已启用，Cron: {cron_expr}")
         except Exception as e:
             logger.error(f"[米画师] 启动调度器失败: {e}")
 
@@ -114,9 +136,15 @@ class MihuasherReviewPlugin(Star):
             logger.error(f"保存评价缓存失败 ({artist_id}): {e}")
 
     async def fetch_reviews(self, artist_id: str) -> dict:
+        """
+        返回格式: {
+            "artist_info": {"name": "...", "avatar": "..."},
+            "reviews": [{"id": int, "content": "...", "time": "...", "commenter_name": "..."}, ...],
+            "error": None 或 错误信息字符串
+        }
+        """
         if not self.cookie:
-            logger.error("未配置米画师 Cookie")
-            return {"artist_info": {}, "reviews": []}
+            return {"artist_info": {}, "reviews": [], "error": "未配置米画师 Cookie"}
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -127,89 +155,120 @@ class MihuasherReviewPlugin(Star):
             'Cookie': self.cookie,
         }
 
-        async with aiohttp.ClientSession() as session:
-            # 获取评价列表
-            reviews_url = f"https://www.mihuashi.com/api/v1/users/{artist_id}/comments"
-            params = {
-                'page': 1,
-                'perspective': 'third',
-                'type': 'employer',
-                'only_image': 'false'
-            }
-            reviews_data = []
+        session = await self._get_session()
+        # 获取评价列表
+        reviews_url = f"https://www.mihuashi.com/api/v1/users/{artist_id}/comments"
+        params = {
+            'page': 1,
+            'perspective': 'third',
+            'type': 'employer',
+            'only_image': 'false'
+        }
+        reviews_data = []
+        try:
+            async with session.get(reviews_url, headers=headers, params=params, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if 'comments' in data and isinstance(data['comments'], list):
+                        for item in data['comments']:
+                            content = item.get('content', '')
+                            raw_time = item.get('created_at', '')
+                            time_str = raw_time.split('T')[0] if 'T' in raw_time else raw_time
+                            commenter_name = item.get('commenter', {}).get('name', '匿名')
+                            if content:
+                                reviews_data.append({
+                                    'id': item.get('id'),
+                                    'content': content.strip(),
+                                    'time': time_str,
+                                    'commenter_name': commenter_name
+                                })
+                    logger.info(f"成功获取 {len(reviews_data)} 条评价")
+                elif resp.status == 403:
+                    return {"artist_info": {}, "reviews": [], "error": "Cookie 无效或已过期，请重新获取"}
+                else:
+                    return {"artist_info": {}, "reviews": [], "error": f"API 返回错误码 {resp.status}"}
+        except asyncio.TimeoutError:
+            return {"artist_info": {}, "reviews": [], "error": "请求超时，请检查网络"}
+        except Exception as e:
+            logger.error(f"获取评价失败: {e}")
+            return {"artist_info": {}, "reviews": [], "error": f"请求异常: {str(e)}"}
+
+        # 获取画师信息（优先使用配置列表）
+        map_info = self.artist_info_map.get(str(artist_id), {})
+        if map_info:
+            artist_name = map_info.get("name", str(artist_id))
+            artist_avatar = map_info.get("avatar", "")
+            logger.info(f"使用配置的画师信息: {artist_id} -> {artist_name}")
+        else:
+            # 无配置则尝试自动解析（可能失败）
+            artist_name = str(artist_id)
+            artist_avatar = ""
             try:
-                async with session.get(reviews_url, headers=headers, params=params, timeout=15) as resp:
+                profile_url = f"https://www.mihuashi.com/profiles/{artist_id}"
+                html_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Cookie': self.cookie,
+                }
+                async with session.get(profile_url, headers=html_headers, timeout=10) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        if 'comments' in data and isinstance(data['comments'], list):
-                            for item in data['comments']:
-                                content = item.get('content', '')
-                                raw_time = item.get('created_at', '')
-                                time_str = raw_time.split('T')[0] if 'T' in raw_time else raw_time
-                                commenter_name = item.get('commenter', {}).get('name', '匿名')
-                                if content:
-                                    reviews_data.append({
-                                        'content': content.strip(),
-                                        'time': time_str,
-                                        'commenter_name': commenter_name
-                                    })
-                        logger.info(f"成功获取 {len(reviews_data)} 条评价")
+                        html = await resp.text()
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html, 'html.parser')
+                        name_elem = soup.find('h2', class_='user-profile__name')
+                        if name_elem:
+                            name_text = name_elem.get_text(strip=True)
+                            name_match = re.match(r'^([^\d]+)', name_text)
+                            artist_name = name_match.group(1).strip() if name_match else name_text
+                            logger.info(f"自动解析画师名字: {artist_name}")
+                        avatar_img = soup.find('img', class_='h-full w-full object-cover')
+                        if avatar_img and avatar_img.get('src'):
+                            avatar_url = avatar_img['src']
+                            if avatar_url.startswith('//'):
+                                avatar_url = 'https:' + avatar_url
+                            artist_avatar = avatar_url
+                            logger.info(f"自动解析画师头像: {artist_avatar[:80]}...")
                     else:
-                        logger.error(f"评价接口返回 {resp.status}")
+                        logger.warning(f"获取画师主页失败: {resp.status}")
             except Exception as e:
-                logger.error(f"获取评价失败: {e}")
+                logger.warning(f"解析画师信息失败: {e}")
 
-            # 获取画师信息（优先使用配置列表）
-            map_info = self.artist_info_map.get(str(artist_id), {})
-            if map_info:
-                artist_name = map_info.get("name", str(artist_id))
-                artist_avatar = map_info.get("avatar", "")
-                logger.info(f"使用配置的画师信息: {artist_id} -> {artist_name}")
-            else:
-                # 无配置则回退到自动解析（可能失败，但保留）
-                artist_name = str(artist_id)
-                artist_avatar = ""
-                try:
-                    profile_url = f"https://www.mihuashi.com/profiles/{artist_id}"
-                    html_headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Cookie': self.cookie,
-                    }
-                    async with session.get(profile_url, headers=html_headers, timeout=10) as resp:
-                        if resp.status == 200:
-                            html = await resp.text()
-                            from bs4 import BeautifulSoup
-                            soup = BeautifulSoup(html, 'html.parser')
-                            name_elem = soup.find('h2', class_='user-profile__name')
-                            if name_elem:
-                                name_text = name_elem.get_text(strip=True)
-                                name_match = re.match(r'^([^\d]+)', name_text)
-                                artist_name = name_match.group(1).strip() if name_match else name_text
-                                logger.info(f"自动解析画师名字: {artist_name}")
-                            avatar_img = soup.find('img', class_='h-full w-full object-cover')
-                            if avatar_img and avatar_img.get('src'):
-                                avatar_url = avatar_img['src']
-                                if avatar_url.startswith('//'):
-                                    avatar_url = 'https:' + avatar_url
-                                artist_avatar = avatar_url
-                                logger.info(f"自动解析画师头像: {artist_avatar[:80]}...")
-                        else:
-                            logger.warning(f"获取画师主页失败: {resp.status}")
-                except Exception as e:
-                    logger.warning(f"解析画师信息失败: {e}")
-
-            return {"artist_info": {"name": artist_name, "avatar": artist_avatar}, "reviews": reviews_data}
+        return {
+            "artist_info": {"name": artist_name, "avatar": artist_avatar},
+            "reviews": reviews_data,
+            "error": None
+        }
 
     async def check_and_notify(self, artist_id: str) -> list:
-        data = await self.fetch_reviews(artist_id)
-        current_reviews = data.get('reviews', [])
+        """
+        检查新评价，返回新增的评价列表（冷启动时不推送）
+        """
+        result = await self.fetch_reviews(artist_id)
+        if result.get("error"):
+            logger.error(f"检查画师 {artist_id} 失败: {result['error']}")
+            return []
+        current_reviews = result.get('reviews', [])
         if not current_reviews:
             return []
+
         saved_data = await self._load_saved_reviews(artist_id)
         saved_reviews = saved_data.get("last_reviews", [])
-        new_reviews = [r for r in current_reviews if r not in saved_reviews]
+
+        # 冷启动检测
+        is_cold_start = not saved_reviews
+
+        # 使用唯一 ID 判定新评价（如果没有 ID 则回退到字典对比）
+        saved_ids = {r.get('id') for r in saved_reviews if r.get('id')}
+        if saved_ids:
+            new_reviews = [r for r in current_reviews if r.get('id') not in saved_ids]
+        else:
+            new_reviews = [r for r in current_reviews if r not in saved_reviews]
+
         if new_reviews:
             await self._save_reviews(artist_id, current_reviews)
+            if is_cold_start:
+                logger.info(f"画师 {artist_id} 首次缓存，已保存 {len(new_reviews)} 条评价，不推送")
+                return []
+
         return new_reviews
 
     async def _send_as_image(self, target_origin: str, artist_id: str, rev: dict):
@@ -239,10 +298,12 @@ class MihuasherReviewPlugin(Star):
             await self.context.send_message(target_origin, MessageChain().message(fallback_msg))
 
     async def _auto_check_all_subscriptions(self):
+        """定时检查所有订阅画师的新评价并推送（并发优化）"""
         logger.info("[米画师] 定时检查所有订阅画师")
         subs_file = self.data_dir / "subscriptions.json"
         if not subs_file.exists():
             return
+
         try:
             async with self._file_lock:
                 with open(subs_file, 'r', encoding='utf-8') as f:
@@ -259,6 +320,7 @@ class MihuasherReviewPlugin(Star):
                 global_origin = global_target
             logger.info(f"使用全局推送目标: {global_origin}")
 
+        # 按画师分组
         artist_targets = {}
         for sub in subscriptions:
             aid = sub.get("artist_id")
@@ -269,13 +331,25 @@ class MihuasherReviewPlugin(Star):
             if aid and target:
                 artist_targets.setdefault(aid, set()).add(target)
 
+        # 收集所有待发送任务
+        tasks = []
         for artist_id, targets in artist_targets.items():
             new_reviews = await self.check_and_notify(artist_id)
             if new_reviews:
                 for rev in new_reviews[:5]:
                     for target in targets:
-                        await self._send_as_image(target, artist_id, rev)
-                logger.info(f"画师 {artist_id} 有 {len(new_reviews)} 条新评价，已推送")
+                        tasks.append(self._send_as_image(target, artist_id, rev))
+
+        if tasks:
+            # 限制并发数为 5，避免资源耗尽
+            semaphore = asyncio.Semaphore(5)
+
+            async def limited_task(task):
+                async with semaphore:
+                    await task
+
+            await asyncio.gather(*[limited_task(t) for t in tasks])
+            logger.info(f"本次定时检查共推送 {len(tasks)} 条消息")
 
     @filter.command("check_review")
     async def check_review(self, event: AstrMessageEvent):
@@ -290,28 +364,34 @@ class MihuasherReviewPlugin(Star):
             return
 
         yield event.plain_result(f"🔍 正在检查画师 {artist_id} 的评价...")
-        data = await self.fetch_reviews(artist_id)
-        artist_info = data.get('artist_info', {})
+        result = await self.fetch_reviews(artist_id)
+
+        if result.get("error"):
+            yield event.plain_result(f"❌ 获取评价失败：{result['error']}")
+            return
+
+        artist_info = result.get('artist_info', {})
         artist_name = artist_info.get('name', artist_id)
         artist_avatar = artist_info.get('avatar', '')
-        reviews = data.get('reviews', [])
+        reviews = result.get('reviews', [])
 
         if not reviews:
-            yield event.plain_result(f"❌ 未找到画师 {artist_id} 的评价")
+            yield event.plain_result(f"✅ 画师 {artist_id} 暂时没有评价")
             return
 
         display_count = min(len(reviews), self.max_display)
 
-        # 构建 Markdown 内容：头像紧靠画师名左侧，尺寸更大
+        # 构建 Markdown 内容
         markdown_lines = [f"# 🎨 米画师评价列表"]
         if artist_avatar:
-            # 使用 <span> 包裹，强制行内布局，头像宽度 64px，保持清晰
-            avatar_html = f'<span style="display: inline-block; vertical-align: middle; margin-right: 8px;"><img src="{artist_avatar}" width="64" style="border-radius: 50%; display: block;"></span>'
+            avatar_html = (
+                f'<span style="display: inline-block; vertical-align: middle; margin-right: 10px;">'
+                f'<img src="{artist_avatar}" width="64" style="border-radius: 50%; display: block;"></span>'
+            )
             markdown_lines.append(f"**画师**: {avatar_html} **{artist_name}**")
         else:
             markdown_lines.append(f"**画师**: {artist_name}")
 
-        # 如果没有从配置中找到名字（且不是默认ID），提示用户配置
         if artist_name == artist_id and str(artist_id) not in self.artist_info_map:
             markdown_lines.append("> ⚠️ **提示**：画师名称未配置，请前往插件配置页面 `画师信息列表` 中填写。")
 
@@ -364,7 +444,8 @@ class MihuasherReviewPlugin(Star):
             "target_session": target_session,
             "subscribe_time": int(time.time())
         }
-        exists = any(s.get("artist_id") == artist_id and s.get("target_session") == target_session for s in subscriptions)
+        exists = any(
+            s.get("artist_id") == artist_id and s.get("target_session") == target_session for s in subscriptions)
         if not exists:
             subscriptions.append(new_sub)
             async with self._file_lock:
@@ -404,7 +485,8 @@ class MihuasherReviewPlugin(Star):
                 yield event.plain_result("❌ 读取订阅失败，请稍后重试")
                 return
 
-            new_subs = [s for s in subscriptions if not (s.get("artist_id") == artist_id and s.get("target_session") == target_session)]
+            new_subs = [s for s in subscriptions if
+                        not (s.get("artist_id") == artist_id and s.get("target_session") == target_session)]
             if len(new_subs) < len(subscriptions):
                 temp_path = subs_file.with_suffix(".tmp")
                 try:
@@ -426,13 +508,16 @@ class MihuasherReviewPlugin(Star):
         if not subs_file.exists():
             yield event.plain_result("你还没有任何订阅")
             return
+
         try:
-            with open(subs_file, 'r', encoding='utf-8') as f:
-                subscriptions = json.load(f)
+            async with self._file_lock:
+                with open(subs_file, 'r', encoding='utf-8') as f:
+                    subscriptions = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             logger.error(f"读取订阅文件失败: {e}")
             yield event.plain_result("❌ 读取订阅失败，请稍后重试")
             return
+
         my_subs = [s for s in subscriptions if s.get("target_session") == target_session]
         if my_subs:
             msg = "📋 当前会话的订阅列表：\n" + "\n".join([f"- 画师ID: {s['artist_id']}" for s in my_subs])
@@ -442,3 +527,6 @@ class MihuasherReviewPlugin(Star):
 
     async def terminate(self):
         self._stop_scheduler()
+        if self._session:
+            await self._session.close()
+            logger.info("[米画师] HTTP 会话已关闭")
